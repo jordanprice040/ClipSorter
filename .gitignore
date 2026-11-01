@@ -1,0 +1,27 @@
+.venv/
+.tmp/
+__pycache__/
+inspection/
+prototype_results/
+prototype_v2_results/
+sort_results/
+Sorted/
+sample_clips/
+
+# Local media, state, credentials, and generated artifacts
+*.[mM][pP]4
+*.mkv
+*.mov
+*.avi
+*.webm
+*.m4v
+*.png
+*.jpg
+*.jpeg
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.partial
+.env
+.env.*
+!.env.example
