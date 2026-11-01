@@ -2,6 +2,7 @@
 import argparse
 import json
 import re
+import math
 from pathlib import Path
 import cv2
 import numpy as np
@@ -90,7 +91,8 @@ class Reader:
     def analyze(self, path, evidence, feed_fallback=False):
         cap=cv2.VideoCapture(str(path))
         fps=cap.get(cv2.CAP_PROP_FPS); count=cap.get(cv2.CAP_PROP_FRAME_COUNT)
-        if fps<=0 or count<=0: raise ValueError('Cannot decode video metadata')
+        if not cap.isOpened() or not math.isfinite(fps) or not math.isfinite(count) or fps<=0 or count<=0:
+            cap.release(); raise ValueError('Cannot decode video metadata')
         duration=count/fps
         evidence.mkdir(parents=True,exist_ok=True)
         def frame_at(t):

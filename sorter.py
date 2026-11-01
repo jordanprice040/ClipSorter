@@ -7,6 +7,7 @@ import os
 import shutil
 import sqlite3
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,10 @@ from pathlib import Path
 CATEGORIES = ['0','1','2','3','4','5+','Needs review','Deathmatch','Range','Outside of match','Short clips']
 EXTENSIONS={'.mp4'}
 ENGINE='report-v2-safe-1'
+CANCEL_FILE=None
+
+def cancelled():
+    return CANCEL_FILE is not None and CANCEL_FILE.exists()
 
 def digest(path):
     h=hashlib.sha256()
@@ -46,7 +51,10 @@ class State:
         self.db.commit()
     def close(self): self.db.close()
     def rows(self):
-        return [dict(source=s,sha256=h,**json.loads(r)) for s,h,r in self.db.execute('SELECT source,sha,result FROM clips WHERE active=1 ORDER BY source')]
+        return list(self.iter_rows())
+    def iter_rows(self):
+        for s,h,r in self.db.execute('SELECT source,sha,result FROM clips WHERE active=1 ORDER BY source'):
+            yield dict(source=s,sha256=h,**json.loads(r))
 
 class Lock:
     """Windows kernel lock releases automatically on crash; no stale lock deletion."""
@@ -68,26 +76,34 @@ class Lock:
         return self
     def __exit__(self,*exc): self.f.close()
 
-def export(state):
-    rows=state.rows()
-    atomic_json(state.work/'results.json',rows)
+def export(state,include_json=True):
+    if include_json:
+        temp=state.work/'results.json.tmp'
+        with temp.open('w',encoding='utf8') as f:
+            f.write('[\n'); separator=''
+            for row in state.iter_rows():
+                f.write(separator); json.dump(row,f); separator=',\n'
+            f.write('\n]\n'); f.flush(); os.fsync(f.fileno())
+        os.replace(temp,state.work/'results.json')
     fields=['source','category','kills','duration','method','reason','timestamps','evidence','sha256']
     temp=state.work/'results.csv.tmp'
     with temp.open('w',newline='',encoding='utf-8-sig') as f:
         writer=csv.DictWriter(f,fieldnames=fields,extrasaction='ignore'); writer.writeheader()
-        for row in rows:
+        for row in state.iter_rows():
             row=dict(row,timestamps=';'.join(f'{t:.3f}' for t in row.get('timestamps',[])))
             writer.writerow(row)
     os.replace(temp,state.work/'results.csv')
 
 def preview(args,state):
-    from prototype import Reader,NAMES,VERSION
+    from prototype import NAMES,VERSION
+    from worker_client import AnalysisWorker
     folder=args.input.resolve(); output=args.output.resolve()
     if not folder.is_dir(): raise ValueError(f'Clips folder not found: {folder}')
     if folder==output or folder.is_relative_to(output): raise ValueError('Output must not contain the input folder')
     if folder==state.work or folder.is_relative_to(state.work): raise ValueError('Work folder must not contain the input folder')
     names=args.names or NAMES
     config=dict(engine=ENGINE,prototype=VERSION,names=names,feed=not args.skip_feed)
+    print('Scanning for MP4 files...',flush=True)
     files=sorted(p.resolve() for p in (folder.rglob('*') if args.recursive else folder.iterdir())
                  if p.is_file() and p.suffix.lower() in EXTENSIONS and p.resolve().is_relative_to(folder) and not p.resolve().is_relative_to(output)
                  and not p.resolve().is_relative_to(state.work))
@@ -95,31 +111,36 @@ def preview(args,state):
     atomic_json(state.work/'plan.json',dict(input=str(folder),output=str(output),recursive=args.recursive,config=config,complete=False))
     state.db.execute('UPDATE clips SET active=0')
     state.db.executemany('UPDATE clips SET active=1 WHERE source=?',[(str(p),) for p in files]); state.db.commit()
-    reader=None
-    for index,path in enumerate(files,1):
-        stat=path.stat(); signature=json.dumps([stat.st_size,stat.st_mtime_ns,config],sort_keys=True)
-        cached=state.db.execute('SELECT signature FROM clips WHERE source=?',(str(path),)).fetchone()
-        if cached and cached[0]==signature and not args.reanalyze:
-            print(f'[{index}/{len(files)}] Resume: {path.name}',flush=True); continue
-        print(f'[{index}/{len(files)}] Analyzing: {path.name}',flush=True)
-        if reader is None: reader=Reader(names)
-        key=hashlib.sha256(str(path).encode()).hexdigest()[:20]
-        evidence=state.work/'evidence'/key
-        # Hash before/after decoding to prevent caching a file changed mid-analysis.
-        sha=digest(path)
-        try:
-            result=reader.analyze(path,evidence,feed_fallback=not args.skip_feed)
-        except (KeyboardInterrupt,SystemExit): raise
-        except Exception as e:
-            result=dict(category='Needs review',kills=None,duration=None,method='decode/OCR error',
-                        reason=f'{type(e).__name__}: {e}',timestamps=[])
-        if path.stat().st_mtime_ns!=stat.st_mtime_ns or digest(path)!=sha:
-            raise RuntimeError(f'Source changed during analysis: {path}')
-        result['evidence']=str(evidence)
-        state.db.execute('INSERT OR REPLACE INTO clips VALUES (?,?,?,?,1)',(str(path),signature,sha,json.dumps(result)))
-        state.db.commit(); export(state)
-        print(f'  {result["category"]}: {result["reason"]}',flush=True)
-    export(state)
+    print(f'Found {len(files):,} MP4 files. Failed or timed-out clips will go to Needs review.',flush=True)
+    worker=AnalysisWorker(timeout=getattr(args,'clip_timeout',120)); last_export=time.monotonic(); changed=0
+    try:
+        for index,path in enumerate(files,1):
+            if cancelled(): raise KeyboardInterrupt
+            cached=state.db.execute("SELECT signature,json_extract(result,'$.method') FROM clips WHERE source=?",(str(path),)).fetchone()
+            signature=None; sha=None
+            try:
+                stat=path.stat(); signature=json.dumps([stat.st_size,stat.st_mtime_ns,config],sort_keys=True)
+                retry=cached and getattr(args,'retry_errors',False) and cached[1] in {'analysis timeout','worker error','decode/OCR error','source unreadable'}
+                if cached and cached[0]==signature and not args.reanalyze and not retry:
+                    print(f'[{index}/{len(files)}] Resume: {path.name}',flush=True); continue
+                print(f'[{index}/{len(files)}] Analyzing: {path.name}',flush=True)
+                key=hashlib.sha256(str(path).encode()).hexdigest()[:20]
+                evidence=state.work/'evidence'/key
+                result,sha=worker.analyze(path,evidence,names,not args.skip_feed,
+                    progress=lambda message:print(message,flush=True),cancelled=cancelled)
+                result['evidence']=str(evidence)
+            except OSError as e:
+                result=dict(category='Needs review',kills=None,duration=None,method='source unreadable',reason=str(e),timestamps=[])
+            state.db.execute('INSERT OR REPLACE INTO clips VALUES (?,?,?,?,1)',(str(path),signature,sha,json.dumps(result)))
+            state.db.commit(); changed+=1
+            if changed%50==0 or time.monotonic()-last_export>=60:
+                try: export(state,include_json=False)
+                except PermissionError: print('  CSV is in use; progress is saved in the database. Close the CSV before preview finishes.',flush=True)
+                last_export=time.monotonic()
+            print(f'  {result["category"]}: {result["reason"]}',flush=True)
+    finally:
+        worker.close()
+        export(state)
     atomic_json(state.work/'plan.json',dict(input=str(folder),output=str(output),recursive=args.recursive,config=config,complete=True))
     print(f'Preview complete: {state.work / "results.csv"}. No clips copied or moved.')
 
@@ -205,10 +226,14 @@ def apply(args,state):
     output=Path(plan['output'])
     # Recover incomplete operations before considering new ones.
     for op in state.db.execute("SELECT * FROM operations WHERE status IN ('prepared','published')").fetchall():
+        if cancelled(): raise KeyboardInterrupt
         finish_operation(state,op)
     for category in CATEGORIES: (output/category).mkdir(parents=True,exist_ok=True)
-    for row in state.rows():
+    for row in state.iter_rows():
+        if cancelled(): raise KeyboardInterrupt
         source=Path(row['source']); sha=row['sha256']
+        if not sha:
+            print(f'Skipped (source could not be verified; originals preserved): {source}',flush=True); continue
         existing=state.db.execute("SELECT mode,destination FROM operations WHERE source=? AND sha=? AND status='done'",(str(source),sha)).fetchone()
         if existing:
             if existing[0]!=args.mode: raise RuntimeError(f'Already applied as {existing[0]}; undo first to switch mode: {source}')
@@ -227,6 +252,7 @@ def apply(args,state):
 
 def undo(args,state):
     for op in state.db.execute("SELECT * FROM operations WHERE status IN ('prepared','done','published','undoing') ORDER BY rowid DESC").fetchall():
+        if cancelled(): raise KeyboardInterrupt
         ident,src,dst,stage,sha,mode,status,owned,restored=op
         source,destination=Path(src),Path(dst)
         if status=='prepared':
@@ -267,13 +293,20 @@ def main():
     q.add_argument('--work',type=Path,default=Path('sort_results')); q.add_argument('--names',nargs='+')
     q.add_argument('--recursive',action='store_true'); q.add_argument('--reanalyze',action='store_true')
     q.add_argument('--skip-feed',action='store_true',help='Skip slow review-only feed fallback')
+    q.add_argument('--clip-timeout',type=float,default=120,help='Maximum total seconds per clip, including hashing and OCR (default 120)')
+    q.add_argument('--retry-errors',action='store_true',help='Retry cached decoder errors and timeouts without reanalyzing successful clips')
     q=sub.add_parser('apply',help='Apply the saved preview')
     q.add_argument('--work',type=Path,default=Path('sort_results')); q.add_argument('--mode',choices=['copy','move'],default='copy')
     q.add_argument('--expected-input',type=Path); q.add_argument('--expected-output',type=Path)
     q.add_argument('--expected-recursive',choices=['true','false'])
     q=sub.add_parser('undo',help='Undo verified operations without overwriting files')
     q.add_argument('--work',type=Path,default=Path('sort_results'))
+    for command in sub.choices.values():
+        command.add_argument('--cancel-file',type=Path,help=argparse.SUPPRESS)
     args=p.parse_args()
+    if hasattr(args,'clip_timeout') and (not 0<args.clip_timeout<86400): p.error('--clip-timeout must be between 0 and 86400 seconds')
+    global CANCEL_FILE
+    CANCEL_FILE=args.cancel_file
     try:
         with Lock(args.work.resolve()):
             state=State(args.work)

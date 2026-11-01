@@ -29,7 +29,17 @@ From this folder in PowerShell:
 .\.venv\Scripts\python.exe sorter.py undo --work "sort_results"
 ```
 
-For moving, explicitly use `--mode move`. Undo a copy before switching the same plan to move. Rerun the same command after an interruption. A completed preview is required before apply. `--recursive` includes subfolders; output and evidence directories are excluded. `--reanalyze` ignores cached analysis. `--skip-feed` skips the slower fallback evidence scan. Preview can create evidence and result files, but never creates sorted video copies or moves originals.
+For moving, explicitly use `--mode move`. Undo a copy before switching the same plan to move. Rerun the same command after an interruption. A completed preview is required before apply. `--recursive` includes subfolders; output and evidence directories are excluded. `--reanalyze` ignores cached analysis. `--skip-feed` skips the slower fallback evidence scan. The desktop interface leaves this optional, review-only feed scan **off by default**, which is recommended for large libraries. Preview can create evidence and result files, but never creates sorted video copies or moves originals.
+
+## Large libraries and decoder errors
+
+The batch size is not limited to a few hundred clips. Video decoding and OCR run in a persistent disposable worker. Every clip has a configurable total deadline, including hashing, OCR, and optional feed tracking: **120 seconds by default**. A timeout or native decoder crash puts the clip in Needs review, restarts the worker, and continues to the next clip. Decoder error spam cannot fill the interface; it shows bounded progress and concise per-clip failures. A deadline is a safety limit, not a runtime estimate or a diagnosis that a clip is corrupt.
+
+The interface keeps at most 1,000 queued messages and about 1,500 visible log lines, and yields between display batches. Saved-preview checks run off the UI thread so a slow drive does not block that check. Stop cancels the current preview worker and preserves completed database results. On copy/move/undo, Stop takes effect between file operations so an in-progress operation can reach a safe state.
+
+Each completed clip is committed immediately to SQLite. CSV snapshots update in batches (50 completed clips or about a minute between clips). Full JSON is streamed when preview finishes or stops cleanly, rather than rewriting all OCR results after every clip. Following a forced termination, SQLite is the source of truth; resume rebuilds the export files. Keep CSV closed in Excel when the final exports are written.
+
+For the E-drive library, reopen the updated program, use the same folders, leave **Collect kill-feed evidence** off, and click Preview / Resume. Existing compatible results are reused. Turn on **Retry previous decoder errors / timeouts** to retry only failures; raise Seconds per clip limit if valid large/slow files reach the default. CLI equivalents are `--skip-feed --clip-timeout 120 --retry-errors`. If a file cannot even be hashed, it is recorded as Needs review and apply leaves its original in place; it is never moved without verification.
 
 All supplied account aliases are built in. Override them for feed evidence with `--names "AccountOne" "AccountTwo"`. Combat-report counting does not depend on your displayed name. Hidden agent names are deliberately not treated as personal aliases.
 
@@ -61,9 +71,9 @@ The original 13 labeled samples were inspected before implementing file operatio
 
 ```powershell
 .\.venv\Scripts\python.exe validate_samples.py sort_results/results.json
-.\.venv\Scripts\python.exe -m unittest -v test_sorter test_recognition
+.\.venv\Scripts\python.exe -m unittest -v test_sorter test_recognition test_resilience
 ```
 
-This is a small development set used to refine the rules, not an independent accuracy benchmark. Test another representative batch in preview mode before moving a larger library. Twenty tests passed: sixteen disposable file-operation tests and four synthetic report-parser checks. These include protection against applying a preview for different folders. The parser tests check that incoming kills are excluded and a dropped outgoing label cannot establish zero. Source-preservation checks refer to the initial validation run, before later user-initiated moves. The desktop interface passed a widget-construction smoke test; its complete interactive workflow has not been manually exercised.
+This is a small development set used to refine the rules, not an independent accuracy benchmark. Test another representative batch in preview mode before moving a larger library. Thirty-one tests passed: sixteen file-operation tests, four synthetic report-parser checks, and eleven worker/scaling/resume checks. These include protection against applying a preview for different folders, native worker crashes, timeouts, log floods, an 11,000-row streaming export, and retrying errors without reanalyzing successes. The 15 labeled samples also matched their labels through the isolated worker. Source-preservation checks refer to read-only validation, before any user-initiated moves. GUI responsiveness was tested with a simulated slow drive and 100,000 log messages. See `LARGE_LIBRARY_FIX.md` for the E-drive investigation and limits.
 
 The unit tests run without sample clips. To repeat clip validation, provide your labeled videos in `sample_clips`, run a preview, then run `validate_samples.py`. The inspection and derived-fixture helper scripts also require these local sample videos.
