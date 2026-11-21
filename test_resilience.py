@@ -121,6 +121,23 @@ class BatchScaling(unittest.TestCase):
         with patch('worker_client.AnalysisWorker',Fake),patch('builtins.print'):
             sorter.preview(args,self.state);args.retry_errors=True;sorter.preview(args,self.state)
         self.assertEqual(calls,['0.mp4','1.mp4','2.mp4','1.mp4'])
+    def test_disable_feed_between_previews(self):
+        folder=self.root/'clips'
+        folder.mkdir()
+        (folder/'first.mp4').write_bytes(b'one')
+        args=argparse.Namespace(input=folder,output=self.root/'Sorted',names=None,skip_feed=False,
+                                recursive=False,reanalyze=False,clip_timeout=1,retry_errors=False)
+        with patch('worker_client.AnalysisWorker') as worker, patch('builtins.print'):
+            analyze=worker.return_value.analyze
+            analyze.return_value=(dict(category='Needs review',method='analysis timeout',reason='test'),None)
+            sorter.preview(args,self.state)
+            (folder/'second.mp4').write_bytes(b'two')
+            args.skip_feed=True
+            sorter.preview(args,self.state)
+            args.skip_feed=False
+            sorter.preview(args,self.state)
+        self.assertEqual([(call.args[0].name,call.args[3]) for call in analyze.call_args_list],
+                         [('first.mp4',True),('second.mp4',False),('second.mp4',True)])
     def test_log_flood_has_bounded_backlog(self):
         buffer=LogBuffer()
         for i in range(100000):buffer.put(f'{i} decoder error\n')

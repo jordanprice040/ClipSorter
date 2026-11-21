@@ -103,6 +103,10 @@ def preview(args,state):
     if folder==state.work or folder.is_relative_to(state.work): raise ValueError('Work folder must not contain the input folder')
     names=args.names or NAMES
     config=dict(engine=ENGINE,prototype=VERSION,names=names,feed=not args.skip_feed)
+    # Previously collected optional evidence remains valid when collection is disabled.
+    compatible_configs=[config]
+    if args.skip_feed:
+        compatible_configs.append(dict(config,feed=True))
     print('Scanning for MP4 files...',flush=True)
     files=sorted(p.resolve() for p in (folder.rglob('*') if args.recursive else folder.iterdir())
                  if p.is_file() and p.suffix.lower() in EXTENSIONS and p.resolve().is_relative_to(folder) and not p.resolve().is_relative_to(output)
@@ -119,9 +123,12 @@ def preview(args,state):
             cached=state.db.execute("SELECT signature,json_extract(result,'$.method') FROM clips WHERE source=?",(str(path),)).fetchone()
             signature=None; sha=None
             try:
-                stat=path.stat(); signature=json.dumps([stat.st_size,stat.st_mtime_ns,config],sort_keys=True)
+                stat=path.stat()
+                signatures=[json.dumps([stat.st_size,stat.st_mtime_ns,item],sort_keys=True)
+                            for item in compatible_configs]
+                signature=signatures[0]
                 retry=cached and getattr(args,'retry_errors',False) and cached[1] in {'analysis timeout','worker error','decode/OCR error','source unreadable'}
-                if cached and cached[0]==signature and not args.reanalyze and not retry:
+                if cached and cached[0] in signatures and not args.reanalyze and not retry:
                     print(f'[{index}/{len(files)}] Resume: {path.name}',flush=True); continue
                 print(f'[{index}/{len(files)}] Analyzing: {path.name}',flush=True)
                 key=hashlib.sha256(str(path).encode()).hexdigest()[:20]
