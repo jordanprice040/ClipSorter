@@ -1,27 +1,33 @@
 # Valorant Clip Sorter
 
-Local Windows Python tool with a small desktop interface and a command line. Only `.mp4` files are scanned (case insensitive); screenshots and other file types are ignored. Input and output folders can be anywhere accessible on your computer. All decoding and OCR run locally. Clips are never uploaded.
+A local Windows tool that sorts a folder of Valorant `.mp4` clips by how many kills each one shows. It reads the end-of-round combat report with OCR, decides a category (0 to 5+ kills, Deathmatch, Range, Outside of match, Short clips, or Needs review), saves timestamped evidence images for every decision, and then copies or moves the files only after you review the preview. It is built to be conservative: when the evidence is ambiguous, the clip goes to Needs review instead of a guess, and every file operation is verified and can be undone.
 
-## Start
+All decoding and OCR run locally. Clips are never uploaded.
 
-On a fresh checkout, install Python 3.13 and run these commands in the project folder:
+## What it does
+
+- **Classifies clips from the HUD.** Detects the game mode from repeated end-of-clip HUD evidence, then searches backward from the end for the last combat report and counts outgoing **KILLED** labels (excluding assists, "KILLED YOU" and damage rows). Two matching report frames are required. Zero kills needs positive visual confirmation, not just missing OCR text.
+- **Falls back safely.** If no reliable report is found, it tracks named kill-feed entries and saves the events, but those clips stay in Needs review.
+- **Handles large libraries.** Decoding and OCR run in a disposable worker process with a per-clip deadline (120 s by default). A timeout or native decoder crash marks that clip for review, restarts the worker and moves on. Results are committed to SQLite per clip, so an interrupted run resumes where it stopped.
+- **Safe file operations.** Preview never touches your videos. Copy uses temp files, SHA-256 verification and no-overwrite publishing; Move deletes an original only after a verified copy. Undo verifies content and refuses to overwrite.
+- **Desktop GUI and CLI.** A tkinter interface with bounded logging that stays responsive, plus a `preview` / `apply` / `undo` command line.
+
+## Tech stack
+
+Python 3.13, OpenCV, RapidOCR (ONNX Runtime), NumPy, Pillow, tkinter, SQLite, `unittest`.
+
+## How to run
+
+On a fresh checkout, install Python 3.13, then in the project folder:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File setup.ps1
 .\launch.cmd
 ```
 
-After setup, double-click **launch.cmd** to open the tool. Sample videos, the Python environment, and generated results are not included in the repository.
+After setup, double-click `launch.cmd` to open the GUI. Pick your clips folder, output folder and a results folder, then click **Preview / Resume**. Review `results.csv` and the images in `evidence/`, then choose **Copy from preview** or **Move from preview**.
 
-Choose your clips folder, output folder, and results/resume folder. Click **Preview / Resume**. Review `results.csv`, `validation.csv` for the supplied samples, and the timestamped images in `evidence`. **Copy from preview** preserves originals. **Move from preview** explicitly removes originals only after verifying a copied destination. Neither action runs automatically after preview.
-
-Changing the folder fields does not analyze those folders. Always click **Preview / Resume** after changing them. Copy/Move stay disabled until the selected input, output, and subfolder setting match a completed preview. The status line identifies the saved preview; move confirmation shows both paths. For each separate clip collection, use a separate results/resume folder to keep its results and undo history together.
-
-Keep the entire results folder: SQLite holds the resumable plan and operation state, while `undo.jsonl` is a readable undo journal. **Undo** removes unchanged copies or restores moved originals. It refuses changed destinations and occupied original paths. Empty category directories remain.
-
-## Command line
-
-From this folder in PowerShell:
+Command line:
 
 ```powershell
 .\.venv\Scripts\python.exe sorter.py preview --input "C:\path\to\clips" --output "C:\path\to\Sorted" --work "sort_results"
@@ -29,51 +35,28 @@ From this folder in PowerShell:
 .\.venv\Scripts\python.exe sorter.py undo --work "sort_results"
 ```
 
-For moving, explicitly use `--mode move`. Undo a copy before switching the same plan to move. Rerun the same command after an interruption. A completed preview is required before apply. `--recursive` includes subfolders; output and evidence directories are excluded. `--reanalyze` ignores cached analysis. `--skip-feed` skips the slower fallback evidence scan. The desktop interface leaves this optional, review-only feed scan **off by default**, which is recommended for large libraries. Preview can create evidence and result files, but never creates sorted video copies or moves originals.
+Useful flags: `--mode move`, `--recursive`, `--reanalyze`, `--skip-feed` (skip the slower kill-feed fallback, recommended for large libraries), `--clip-timeout 120`, `--retry-errors`, and `--names "AccountOne" "AccountTwo"` to set the account names used for kill-feed evidence.
 
-## Large libraries and decoder errors
+Sample videos, the Python environment and generated results are not included in the repo.
 
-The batch size is not limited to a few hundred clips. Video decoding and OCR run in a persistent disposable worker. Every clip has a configurable total deadline, including hashing, OCR, and optional feed tracking: **120 seconds by default**. A timeout or native decoder crash puts the clip in Needs review, restarts the worker, and continues to the next clip. Decoder error spam cannot fill the interface; it shows bounded progress and concise per-clip failures. A deadline is a safety limit, not a runtime estimate or a diagnosis that a clip is corrupt.
+## Output files
 
-The interface keeps at most 1,000 queued messages and about 1,500 visible log lines, and yields between display batches. Saved-preview checks run off the UI thread so a slow drive does not block that check. Stop cancels the current preview worker and preserves completed database results. On copy/move/undo, Stop takes effect between file operations so an in-progress operation can reach a safe state.
+| File | Contents |
+|---|---|
+| `results.csv` | Category, kill count, duration, method, reason, evidence timestamps, SHA-256 per clip |
+| `results.json` | Full OCR observations, report checks, fallback feed events |
+| `plan.json`, `state.sqlite3` | Preview settings, cached results, operation recovery state |
+| `undo.jsonl` | Durable journal of copy/move/undo events |
+| `evidence/` | Timestamped screenshots behind each decision |
 
-Each completed clip is committed immediately to SQLite. CSV snapshots update in batches (50 completed clips or about a minute between clips). Full JSON is streamed when preview finishes or stops cleanly, rather than rewriting all OCR results after every clip. Following a forced termination, SQLite is the source of truth; resume rebuilds the export files. Keep CSV closed in Excel when the final exports are written.
-
-For the E-drive library, reopen the updated program, use the same folders, leave **Collect kill-feed evidence** off, and click Preview / Resume. Existing compatible results are reused. Turn on **Retry previous decoder errors / timeouts** to retry only failures; raise Seconds per clip limit if valid large/slow files reach the default. CLI equivalents are `--skip-feed --clip-timeout 120 --retry-errors`. If a file cannot even be hashed, it is recorded as Needs review and apply leaves its original in place; it is never moved without verification.
-
-All supplied account aliases are built in. Override them for feed evidence with `--names "AccountOne" "AccountTwo"`. Combat-report counting does not depend on your displayed name. Hidden agent names are deliberately not treated as personal aliases.
-
-## Decisions
-
-Output categories are `0`, `1`, `2`, `3`, `4`, `5+`, `Needs review`, `Deathmatch`, `Range`, `Outside of match`, and `Short clips`.
-
-1. Repeated ending HUD evidence determines range, deathmatch, or outside-of-match first. Earlier match content does not override that ending state. Inconsistent mode evidence goes to review.
-2. A standard-match clip shorter than **20 seconds** goes directly to Short clips when a standard round timer is positively identified. Unknown or nonstandard clips do not enter this category merely because they are short.
-3. Search backward from the ending, densely sampling its last two seconds, for the last shown combat report. Require two complete report frames with matching outgoing kill counts. Count exact left-side **KILLED** labels, exclude **ASSIST**, incoming **KILLED YOU**, killer banners, and damage totals. A visual outgoing highlight check guards against dropped kill/assist OCR labels. Evidence timestamps refer to seconds from the start of the clip.
-4. Zero requires readable outgoing damage rows and visual confirmation that no unaccounted outgoing kill/assist highlights remain; missing OCR alone never establishes zero. Ambiguous reports go to review.
-5. If no reliable report is found, track named outgoing kill-feed entries at two samples per second, deduplicate persistent entries, and save event timestamps and images. **Feed fallback remains review-only**: it cannot safely prove a complete final-round total from a partial recording, menus, resurrection, or a hidden player name. Candidate events are in `results.json`; these clips stay in Needs review.
-
-The report search covers the last 30 seconds. Clips whose relevant report occurs earlier, non-English HUDs, unusual overlays/crops, HDR/color changes, other HUD versions, and unsupported modes may need review. Two OCR frames are a consistency check, not a calibrated confidence probability. Deathmatch recognition uses its top-bar score sequence/timer and respawn or multikill HUD text; it does not total deathmatch kills.
-
-## Files and safety
-
-- `results.csv`: source, category, kill count when established, duration, method, reason, evidence timestamps, evidence directory, and SHA-256.
-- `results.json`: full OCR observations, report checks, and fallback feed events.
-- `plan.json` / `state.sqlite3`: preview settings, completion marker, cached results, and operation recovery state.
-- `undo.jsonl`: durable prepare, publish, completion, and undo events.
-- `evidence`: timestamped screenshots for inspection.
-
-Copies use temporary files, SHA-256 verification, and publication that refuses to overwrite a destination. Filename collisions get `(1)`, `(2)`, etc. File identity is recorded before publication to recover the interruption between a rename and the next database commit. Move deletes the source only after verified publication. Undo also verifies file content and refuses overwrites. One process can use a given results folder at a time. Preserve the journal/database and avoid changing files while applying or undoing. This is an undo facility, not a replacement for backups.
-
-## Validation
-
-The original 13 labeled samples were inspected before implementing file operations. A first prototype exposed a deathmatch misclassification and two conservative review results; the revised prototype matched all 13 labels. After adding the short and zero-kill clips and a visual check for dropped report labels, the final preview matched **15 of 15** supplied labels. All source checksums were verified unchanged. Labels are consumed only by `validate_samples.py`, never the visual classifier. See `VALIDATION.md` and `sort_results/validation.csv` for the per-clip results.
+## Testing and validation
 
 ```powershell
-.\.venv\Scripts\python.exe validate_samples.py sort_results/results.json
 .\.venv\Scripts\python.exe -m unittest -v test_sorter test_recognition test_resilience
 ```
 
-This is a small development set used to refine the rules, not an independent accuracy benchmark. Test another representative batch in preview mode before moving a larger library. Thirty-one tests passed: sixteen file-operation tests, four synthetic report-parser checks, and eleven worker/scaling/resume checks. These include protection against applying a preview for different folders, native worker crashes, timeouts, log floods, an 11,000-row streaming export, and retrying errors without reanalyzing successes. The 15 labeled samples also matched their labels through the isolated worker. Source-preservation checks refer to read-only validation, before any user-initiated moves. GUI responsiveness was tested with a simulated slow drive and 100,000 log messages. See `LARGE_LIBRARY_FIX.md` for the E-drive investigation and limits.
+The unit tests run without sample clips: 31 tests covering file operations, a synthetic report parser, worker crashes, timeouts, log floods, resume, an 11,000-row streaming export, and retrying only failed clips. On my labeled development set, the final preview matched all 15 of 15 labels (`validate_samples.py`, details in [VALIDATION.md](VALIDATION.md)). That set was used to refine the rules, so it is a sanity check, not an independent accuracy benchmark. [LARGE_LIBRARY_FIX.md](LARGE_LIBRARY_FIX.md) covers the scaling work.
 
-The unit tests run without sample clips. To repeat clip validation, provide your labeled videos in `sample_clips`, run a preview, then run `validate_samples.py`. The inspection and derived-fixture helper scripts also require these local sample videos.
+## Known limits
+
+The report search covers the last 30 seconds of a clip. Non-English HUDs, unusual overlays or crops, HDR or color changes, other HUD versions and unsupported modes may land in Needs review. Deathmatch is recognized but its kills are not counted.
